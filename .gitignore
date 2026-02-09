@@ -1,0 +1,14 @@
+# Cache del carver
+wode_index.json
+
+# Binarios de juegos (ISOs)
+*.iso
+*.ISO
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
