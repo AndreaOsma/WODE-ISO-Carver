@@ -7,7 +7,7 @@ import re
 import json
 import argparse
 
-# --- DEFAULT CONFIGURATION ---
+# --- SYSTEM CONFIGURATION ---
 DEFAULT_DISK = ""
 DEFAULT_DEST = "./extracted_games/"
 WII_MAGIC = b"\x5D\x1C\x9E\xA3"
@@ -18,30 +18,33 @@ CHUNK_SIZE = 1024 * 1024 * 32
 SECTOR_SIZE = 512
 
 def format_time(seconds):
+    """Returns a formatted time string (HH:MM:SS)"""
     if seconds < 0: return "00:00:00"
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
 def get_macos_disk_size(disk_path):
+    """Retrieves physical disk size using macOS diskutil"""
     try:
         standard_disk = disk_path.replace('rdisk', 'disk')
         cmd = ['diskutil', 'info', standard_disk]
         output = subprocess.check_output(cmd).decode('utf-8')
         match = re.search(r'Disk Size:.*?(\d+) Bytes', output)
         return int(match.group(1)) if match else 0
-    except: return 0
+    except Exception:
+        return 0
 
 def extract_iso(disk_path, offset, size, dest_path):
-    print(f"Extrayendo ISO en offset {offset}...")
+    """Performs sector-aligned data extraction from block device"""
+    print(f"[*] Extracting ISO image at offset {offset}...")
     try:
         with open(disk_path, "rb") as f:
-            # En macOS rdisk, el seek debe estar alineado
+            # Align seek to hardware sector boundaries for rdisk compatibility
             aligned_offset = (offset // SECTOR_SIZE) * SECTOR_SIZE
             diff = offset - aligned_offset
             
             f.seek(aligned_offset)
-            # Descartamos el gap de alineacion si existe
             if diff > 0:
-                f.read(diff)
+                f.read(diff) # Discard alignment padding
                 
             start_time = time.time()
             with open(dest_path, "wb") as out:
@@ -60,23 +63,23 @@ def extract_iso(disk_path, offset, size, dest_path):
                     bar = "█" * int(25 * written // size)
                     sys.stdout.write(f"\r    [{bar:25s}] {(written/size)*100:6.2f}% | {speed:5.1f} MB/s | ETA: {format_time(eta)}")
                     sys.stdout.flush()
-            print(f"\nFinalizado: {dest_path}")
+            print(f"\n[+] Extraction completed: {dest_path}")
     except Exception as e:
-        sys.stderr.write(f"\nError en extraccion: {e}\n")
+        sys.stderr.write(f"\n[!] Error during extraction: {e}\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="WODE ISO Carver para Power Users")
-    parser.add_argument("--disk", default=DEFAULT_DISK, help="Ruta del dispositivo (ej. /dev/rdisk12)")
-    parser.add_argument("--dest", default=DEFAULT_DEST, help="Carpeta de destino")
-    parser.add_argument("--offset", type=int, help="Offset manual para saltar indexacion")
-    parser.add_argument("--id", default="MANUAL", help="ID para el modo manual")
-    parser.add_argument("--force-scan", action="store_true", help="Ignora el JSON y escanea")
-    parser.add_argument("--skip-scan", action="store_true", help="Salta el escaneo si no hay JSON")
+    parser = argparse.ArgumentParser(description="WODE ISO Carver - Digital Forensics Tool for WFS Recovery")
+    parser.add_argument("--disk", default=DEFAULT_DISK, help="Source block device (e.g., /dev/rdisk12)")
+    parser.add_argument("--dest", default=DEFAULT_DEST, help="Destination directory")
+    parser.add_argument("--offset", type=int, help="Manual offset for direct extraction")
+    parser.add_argument("--id", default="MANUAL", help="Game ID for manual mode")
+    parser.add_argument("--force-scan", action="store_true", help="Ignore JSON cache and force full scan")
+    parser.add_argument("--skip-scan", action="store_true", help="Abort if no JSON index is found")
     
     args = parser.parse_args()
     
     if not args.disk and args.offset is None:
-        sys.stderr.write("Error: Debes especificar un disco con --disk o usar el modo manual con --offset.\n")
+        sys.stderr.write("[!] Error: No source disk specified. Use --disk or --offset.\n")
         sys.exit(1)
 
     if not os.path.exists(args.dest):
@@ -86,18 +89,23 @@ def main():
     found_games = []
 
     if args.offset is not None:
-        print(f"MODO MANUAL: Extrayendo desde offset {args.offset}")
-        filename = os.path.join(args.dest, f"{args.id}_Manual_Dump.iso")
-        extract_iso(args.disk, args.offset, WII_SIZE, filename)
+        print(f"[*] MANUAL MODE: Target offset {args.offset}")
+        target_file = os.path.join(args.dest, f"{args.id}_Dump.iso")
+        extract_iso(args.disk, args.offset, WII_SIZE, target_file)
         return
 
+    # --- CACHE MANAGEMENT ---
     if not args.force_scan and os.path.exists(index_file):
-        print(f"Cargando indice desde {index_file}...")
-        with open(index_file, 'r') as jf:
-            found_games = json.load(jf)
+        print(f"[*] Loading cached index: {index_file}")
+        try:
+            with open(index_file, 'r') as jf:
+                found_games = json.load(jf)
+        except Exception as e:
+            sys.stderr.write(f"[!] Warning: Failed to load cache. {e}\n")
     
+    # --- INDEXING PHASE ---
     if not found_games and not args.skip_scan:
-        print("Iniciando escaneo robusto (alineado)...")
+        print(f"[*] Initiating robust sector-aligned scan on {args.disk}...")
         total_size = get_macos_disk_size(args.disk)
         
         try:
@@ -105,16 +113,15 @@ def main():
                 offset = 0
                 scan_start = time.time()
                 while True:
-                    # Evitamos sobrepasar el final del disco para prevenir Errno 22
                     remaining = total_size - offset if total_size > 0 else CHUNK_SIZE
                     if remaining <= 0: break
-                    current_chunk_size = min(CHUNK_SIZE, remaining)
                     
+                    current_chunk_size = min(CHUNK_SIZE, remaining)
                     current_pos = f.tell()
                     chunk = f.read(current_chunk_size)
                     if not chunk: break
                     
-                    # Busqueda de firmas en el buffer
+                    # Search for magic signatures within memory buffer
                     pos_wii = chunk.find(WII_MAGIC)
                     pos_gc = chunk.find(GC_MAGIC)
                     
@@ -122,17 +129,15 @@ def main():
                         is_wii = (pos_wii != -1)
                         local_pos = pos_wii if is_wii else pos_gc
                         
-                        # El inicio real de la ISO es relativo a la firma
                         relative_iso_start = local_pos - (24 if is_wii else 28)
                         iso_start = current_pos + relative_iso_start
                         
-                        # Extraemos metadatos del buffer (evita lecturas desalineadas)
+                        # In-memory metadata extraction to avoid unaligned I/O errors
                         try:
-                            h_start = relative_iso_start
-                            header = chunk[h_start:h_start+128]
+                            header = chunk[relative_iso_start : relative_iso_start+128]
                             gid = header[:6].decode('ascii', errors='ignore').strip()
                             gname = header[32:96].decode('ascii', errors='ignore').strip('\x00').strip()
-                        except:
+                        except Exception:
                             gid, gname = "UNK", "Unknown"
 
                         found_games.append({
@@ -141,7 +146,7 @@ def main():
                             'size': WII_SIZE if is_wii else GC_SIZE
                         })
                         
-                        # Saltar ISO y alinear al siguiente sector de 512 bytes
+                        # Skip ISO content and align to next hardware sector
                         next_pos = iso_start + (WII_SIZE if is_wii else GC_SIZE)
                         aligned_next = (next_pos // SECTOR_SIZE) * SECTOR_SIZE
                         
@@ -155,38 +160,51 @@ def main():
                         elapsed = time.time() - scan_start
                         speed = offset / elapsed if elapsed > 0 else 1
                         eta = (total_size - offset) / speed
-                        sys.stdout.write(f"\r   Progress: {(offset/total_size)*100:6.2f}% | V: {speed/(1024**2):.1f} MB/s | ETA: {format_time(eta)}")
+                        sys.stdout.write(f"\r    Indexing: {(offset/total_size)*100:6.2f}% | V: {speed/(1024**2):.1f} MB/s | ETA: {format_time(eta)}")
                         sys.stdout.flush()
 
                 with open(index_file, 'w') as jf:
                     json.dump(found_games, jf, indent=4)
-                print(f"\nIndice guardado.")
+                print(f"\n[*] Index persistent storage updated.")
         except Exception as e:
-            sys.stderr.write(f"\nError durante escaneo: {e}\n"); return
+            sys.stderr.write(f"\n[!] Critical scan error: {e}\n"); return
+    elif args.skip_scan and not found_games:
+        print("[*] Scan skipped by user. No cached data available.")
+        return
 
+    # --- SELECTION MENU ---
     if not found_games: return
-    print(f"\n{'='*65}\nJUEGOS DISPONIBLES\n{'='*65}")
+    print("\n" + "="*65)
+    print(f"{'INDEXED TITLES':^65}")
+    print("="*65)
     for i, g in enumerate(found_games, 1):
-        print(f"{i:2d}. [{g['type']}] {g['id']} - {g['name']}")
-    print(f"{'='*65}")
+        print(f"{i:2d}. [{g['type']}] {g['id']:6s} | {g['name']}")
+    print("="*65)
     
-    choice = input("\nElige numero, lista (1,3) o 'all' (o 'q' para salir): ").strip().lower()
-    if choice == 'q': return
-    
-    to_extract = found_games if choice == 'all' else []
-    if not to_extract:
-        try:
+    try:
+        choice = input("\nEnter selection (ID, comma-separated list, or 'all'): ").strip().lower()
+        if choice in ['q', 'exit', 'quit']: return
+        
+        to_extract = found_games if choice == 'all' else []
+        if not to_extract:
             indices = [int(i.strip()) - 1 for i in choice.split(',')]
             to_extract = [found_games[i] for i in indices if 0 <= i < len(found_games)]
-        except: sys.stderr.write("Seleccion invalida.\n"); return
+    except (ValueError, IndexError):
+        sys.stderr.write("[!] Error: Invalid selection provided.\n"); return
 
+    # --- BATCH EXTRACTION ---
+    print(f"\n[*] Processing batch: {len(to_extract)} files targeted.\n")
     for g in to_extract:
         clean_name = "".join([c for c in g['name'] if c.isalnum() or c in (' ', '_', '-')]).replace(' ', '_')
         dest = os.path.join(args.dest, f"{g['id']}_{clean_name}.iso")
         if not os.path.exists(dest):
             extract_iso(args.disk, g['offset'], g['size'], dest)
         else:
-            print(f"{g['name']} ya existe. Saltando...")
+            print(f"[-] Skip: {g['name']} already exists.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Process terminated by user.")
+        sys.exit(0)
